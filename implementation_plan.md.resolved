@@ -1,0 +1,380 @@
+# Agentic Sports Slot Booking Bot — Python Rebuild
+
+## Background
+
+This is a complete rewrite of the [existing Node.js/Playwright/Prisma sports booking bot](https://github.com/Samay4405/sports-bot) that automates slot booking on the MIT-WPU sports portal (`sports.mitwpu.edu.in`). The original suffered from:
+
+1. **Fragile hardcoded selectors** that broke whenever the portal's Next.js UI changed
+2. **GitHub Actions cron delays** of 30–120 minutes, missing the 5:00 AM booking window
+3. **Neon PostgreSQL cold starts** causing `PrismaClientInitializationError` crashes
+4. **Silent failures** — the bot would fail without any notification to the operator
+
+The rebuild moves everything to Python with an **LLM-driven booking agent** that reasons over live pages instead of using fixed selectors.
+
+---
+
+## User Review Required
+
+> [!IMPORTANT]
+> **Oracle Cloud Free Tier Update (2026):** The Always Free ARM allocation has been reduced to **2 OCPUs / 12 GB RAM** (down from the original 4/24). This is still more than adequate for this project. Just note the limit when provisioning.
+
+> [!WARNING]
+> **Credential Migration:** Your existing credentials in the Neon PostgreSQL database are AES-256-GCM encrypted. We'll need your `ENCRYPTION_KEY` to migrate them to the new system. Alternatively, you can re-enter credentials through the new admin panel.
+
+> [!IMPORTANT]
+> **Dashboard Decision:** The plan uses **FastAPI + Jinja2/HTMX** for the admin panel (no React). This keeps the entire stack in Python and eliminates the need for a separate frontend build. If you'd prefer to keep React, let me know and I'll adjust.
+
+---
+
+## Open Questions
+
+> [!IMPORTANT]
+> 1. **Telegram Bot Token**: Do you already have a Telegram bot created? If not, I'll include instructions for setting one up via @BotFather. You'll need to provide the bot token and your chat ID.
+> 2. **Google AI Studio API Key**: Do you already have a Gemini API key from [AI Studio](https://aistudio.google.com/)? The free tier gives 15 RPM for Gemini 2.0 Flash which is sufficient.
+> 3. **Oracle Cloud Account**: Have you already signed up for Oracle Cloud? If not, we'll set that up as a separate phase after the core bot is working locally.
+> 4. **Existing Data Migration**: Do you want to migrate existing tasks/run history from the old Neon PostgreSQL database, or start fresh?
+
+---
+
+## Project Structure
+
+```
+sports-bot-v2/
+├── alembic/                    # Database migrations
+│   ├── versions/
+│   └── env.py
+├── app/
+│   ├── __init__.py
+│   ├── main.py                 # FastAPI app + lifespan (scheduler startup)
+│   ├── config.py               # Pydantic Settings (env vars, secrets)
+│   ├── database.py             # SQLAlchemy async engine + session factory
+│   │
+│   ├── models/                 # SQLModel ORM models
+│   │   ├── __init__.py
+│   │   ├── task.py             # BookingTask model
+│   │   └── run.py              # BookingRun + RunLog models
+│   │
+│   ├── api/                    # FastAPI routers
+│   │   ├── __init__.py
+│   │   ├── tasks.py            # CRUD for booking tasks
+│   │   ├── runs.py             # Run history / log viewing
+│   │   └── system.py           # Health check, manual trigger
+│   │
+│   ├── agent/                  # LLM-driven booking agent
+│   │   ├── __init__.py
+│   │   ├── booking_agent.py    # Main agent orchestrator
+│   │   ├── llm_provider.py     # Abstraction layer (Gemini, swappable)
+│   │   └── prompts.py          # System prompts for the agent
+│   │
+│   ├── scheduler/              # APScheduler integration
+│   │   ├── __init__.py
+│   │   └── manager.py          # Scheduler setup, job management
+│   │
+│   ├── notifications/          # Telegram alerts
+│   │   ├── __init__.py
+│   │   └── telegram.py         # Send success/failure messages
+│   │
+│   ├── security/               # Credential encryption
+│   │   ├── __init__.py
+│   │   └── crypto.py           # AES-256-GCM encrypt/decrypt
+│   │
+│   └── templates/              # Jinja2 HTML templates (admin panel)
+│       ├── base.html
+│       ├── dashboard.html
+│       ├── tasks.html
+│       ├── task_form.html
+│       ├── runs.html
+│       └── run_detail.html
+│
+├── static/                     # CSS, JS for admin panel
+│   ├── style.css
+│   └── htmx.min.js
+│
+├── screenshots/                # Failure screenshots saved here
+├── tests/
+│   ├── test_crypto.py
+│   ├── test_scheduler.py
+│   └── test_agent.py
+│
+├── docker/
+│   ├── Dockerfile
+│   └── docker-compose.yml
+│
+├── .env.example
+├── alembic.ini
+├── pyproject.toml               # Dependencies (using uv/pip)
+├── requirements.txt
+└── README.md
+```
+
+---
+
+## Proposed Changes
+
+### Phase 1: Foundation (Config, DB, Models, Crypto)
+
+#### [NEW] `pyproject.toml`
+Project metadata and all dependencies:
+- `fastapi[standard]`, `uvicorn`, `sqlmodel`, `sqlalchemy[asyncio]`, `asyncpg`, `alembic`
+- `browser-use`, `playwright`, `langchain-google-genai`
+- `apscheduler>=4.0`, `cryptography`, `httpx` (for Telegram), `python-dotenv`
+- `jinja2`, `python-multipart`
+
+#### [NEW] `app/config.py`
+Pydantic `BaseSettings` class loading from `.env`:
+- `DATABASE_URL` (PostgreSQL connection string)
+- `ENCRYPTION_KEY` (32-byte hex for AES-256-GCM)
+- `GOOGLE_API_KEY` (Gemini API key)
+- `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID`
+- `LLM_MODEL` (default: `gemini-2.0-flash`, swappable)
+- `BOOKING_RETRY_OFFSETS` (default: `[-2, 0, 2, 5, 10, 15]` seconds around target time)
+- `SCREENSHOT_DIR` (default: `./screenshots`)
+
+#### [NEW] `app/database.py`
+Async SQLAlchemy engine using `postgresql+asyncpg://`. Session factory with `expire_on_commit=False`. FastAPI dependency `get_session()`.
+
+#### [NEW] `app/models/task.py`
+```python
+class BookingTask(SQLModel, table=True):
+    id: uuid.UUID                # Primary key
+    sport: str                   # e.g., "Swimming Pool"
+    slot_time: str               # e.g., "5:00 PM – 5:40 PM"
+    website_url: str             # Portal URL
+    username_encrypted: str      # AES-256-GCM encrypted
+    password_encrypted: str      # AES-256-GCM encrypted
+    trigger_time: str            # HH:MM in IST
+    enabled: bool = True
+    fallback_slots: list[str]    # JSON list of backup slot times
+    created_at: datetime
+    updated_at: datetime
+```
+
+#### [NEW] `app/models/run.py`
+```python
+class BookingRun(SQLModel, table=True):
+    id: uuid.UUID
+    task_id: uuid.UUID           # FK → BookingTask
+    status: str                  # "success" | "failed" | "no_slots" | "error"
+    executed_at: datetime
+    completed_at: datetime | None
+    attempt_count: int
+    summary: str                 # Human-readable outcome
+    screenshot_path: str | None  # Path to failure screenshot
+
+class RunLog(SQLModel, table=True):
+    id: uuid.UUID
+    run_id: uuid.UUID            # FK → BookingRun
+    timestamp: datetime
+    level: str                   # "info" | "warn" | "error" | "debug"
+    message: str
+    reasoning: str | None        # LLM's reasoning at this step
+```
+
+#### [NEW] `app/security/crypto.py`
+AES-256-GCM encryption/decryption using Python's `cryptography` library. Compatible with the original Node.js encryption format so credentials can be migrated if desired.
+
+#### [NEW] `alembic/` + `alembic.ini`
+Database migrations setup targeting async PostgreSQL.
+
+---
+
+### Phase 2: Booking Agent (Core Intelligence)
+
+#### [NEW] `app/agent/llm_provider.py`
+Thin abstraction over LLM providers:
+```python
+class LLMProvider(Protocol):
+    async def create_agent(self, task: str, **kwargs) -> Agent: ...
+
+class GeminiProvider:
+    """Uses langchain_google_genai.ChatGoogleGenerativeAI"""
+    def __init__(self, model: str = "gemini-2.0-flash"):
+        self.llm = ChatGoogleGenerativeAI(model=model)
+    
+    async def create_agent(self, task: str, **kwargs) -> Agent:
+        return Agent(task=task, llm=self.llm, **kwargs)
+```
+This lets you swap to OpenAI, Anthropic, or local models without changing agent logic.
+
+#### [NEW] `app/agent/prompts.py`
+System prompt templates for the booking agent. Includes:
+- Login instructions (fill email/password, click login, verify dashboard)
+- Navigation to `/sports` page
+- Search for the target sport using the search bar
+- Click the sport card → View Slots
+- Find the target slot time → View Spots → Select a spot
+- Accept terms → Confirm booking
+- Handle fallback slots if primary is full
+- Take screenshots on failure with detailed error context
+
+The prompts explicitly encode the booking flow steps but **do NOT hardcode selectors** — the LLM reads the live DOM and decides what to click.
+
+#### [NEW] `app/agent/booking_agent.py`
+Main orchestrator:
+```python
+async def run_booking(task: BookingTask, run_logger: RunLogger) -> BookingResult:
+    """
+    1. Decrypt credentials
+    2. Initialize browser-use Agent with Gemini + detailed task prompt
+    3. Execute the agent with retry logic:
+       - Attempt at T-2s, T, T+2s, T+5s, T+10s, T+15s
+       - Each attempt: fresh agent run with full login→book flow
+       - If slot booked: return success
+       - If slot unavailable: try fallback slots
+    4. Save screenshot on failure
+    5. Return result with full reasoning log
+    """
+```
+
+Key design decisions:
+- **browser-use handles DOM interpretation** — we pass a natural language task and the LLM decides what elements to interact with
+- **Retry burst around target time** — configurable offsets ensure we catch slots even if they open slightly early or late
+- **Screenshot + HTML capture on failure** — saved to `screenshots/` directory with task ID and timestamp
+- **Full reasoning log** — every LLM decision step is recorded in `RunLog` for debugging
+
+---
+
+### Phase 3: Scheduler + Notifications
+
+#### [NEW] `app/scheduler/manager.py`
+APScheduler with `AsyncIOScheduler` integrated into FastAPI lifespan:
+```python
+- On startup: query all enabled tasks from DB
+- For each task: schedule a cron job at `trigger_time - 2 minutes`
+  (agent wakes early, waits until exact time, then fires burst)
+- When a task is created/updated/deleted via API: dynamically add/remove jobs
+- Job execution: runs the booking agent in a background asyncio task
+```
+
+The scheduler lives **inside the always-on service** — no external CI pipeline needed.
+
+#### [NEW] `app/notifications/telegram.py`
+Simple Telegram Bot API integration via `httpx`:
+```python
+async def send_notification(bot_token: str, chat_id: str, message: str):
+    """Send a message via Telegram Bot API"""
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    await httpx.AsyncClient().post(url, json={
+        "chat_id": chat_id,
+        "text": message,
+        "parse_mode": "HTML"
+    })
+```
+Called on:
+- ✅ **Booking success** — includes sport, slot, time
+- ❌ **Booking failure** — includes error reason, attempt count
+- ⚠️ **System error** — agent crash, DB connection failure, etc.
+
+---
+
+### Phase 4: API + Admin Panel
+
+#### [NEW] `app/api/tasks.py`
+CRUD endpoints for booking tasks:
+- `GET /api/tasks` — list all tasks
+- `POST /api/tasks` — create new task (encrypts credentials)
+- `PUT /api/tasks/{id}` — update task (re-encrypts if password changed)
+- `DELETE /api/tasks/{id}` — delete task + remove scheduler job
+- `POST /api/tasks/{id}/toggle` — enable/disable task
+- `POST /api/tasks/{id}/trigger` — manual immediate trigger
+
+#### [NEW] `app/api/runs.py`
+Run history endpoints:
+- `GET /api/runs` — list recent runs with status
+- `GET /api/runs/{id}` — full run detail with all log entries + reasoning
+- `GET /api/runs/{id}/screenshot` — serve failure screenshot
+
+#### [NEW] `app/api/system.py`
+- `GET /api/health` — health check (DB connectivity, scheduler status)
+- `GET /api/scheduler/jobs` — list all scheduled jobs with next fire time
+
+#### [NEW] `app/templates/*.html` + `static/`
+Minimal but functional admin panel using Jinja2 + HTMX:
+- **Dashboard**: Overview of tasks, recent runs, next scheduled fires
+- **Task Management**: Create/edit/delete booking tasks with form validation
+- **Run History**: Filterable run list with status badges, expandable log details
+- **Run Detail**: Full step-by-step log with LLM reasoning, failure screenshots
+
+Styling: Clean, dark-themed admin panel. No heavy framework — vanilla CSS with modern aesthetics.
+
+---
+
+### Phase 5: Docker + Deployment
+
+#### [NEW] `docker/Dockerfile`
+Multi-stage build:
+1. Install Python deps + Playwright + Chromium
+2. Copy app code
+3. Run with `uvicorn` (single worker since scheduler must be singleton)
+
+#### [NEW] `docker/docker-compose.yml`
+```yaml
+services:
+  app:
+    build: .
+    ports: ["8000:8000"]
+    env_file: .env
+    volumes:
+      - ./screenshots:/app/screenshots
+    depends_on: [postgres]
+    restart: always
+  
+  postgres:
+    image: postgres:16-alpine
+    volumes: [pgdata:/var/lib/postgresql/data]
+    environment:
+      POSTGRES_DB: sportsbot
+      POSTGRES_USER: sportsbot
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    restart: always
+
+volumes:
+  pgdata:
+```
+
+No external Neon dependency — PostgreSQL runs locally in the same Docker Compose stack, eliminating cold-start issues entirely.
+
+---
+
+## Architecture Comparison: Old vs New
+
+| Aspect | Old (Node.js) | New (Python) |
+|--------|--------------|--------------|
+| **Selectors** | Hardcoded CSS/XPath — broke on UI changes | LLM reads live DOM — adapts automatically |
+| **Scheduling** | GitHub Actions cron (30-120 min delays) | APScheduler in-process (sub-second precision) |
+| **Database** | Neon PostgreSQL (cold-start crashes) | Local PostgreSQL in Docker (always warm) |
+| **Failure handling** | Silent — no notifications | Telegram alerts + full reasoning logs |
+| **Infrastructure** | GitHub Actions (unreliable free tier) | Oracle Cloud Always Free VM (always on) |
+| **Retry strategy** | Single attempt at fixed time | Burst of 6 attempts around target time |
+| **Credential security** | AES-256-GCM (Node.js) | AES-256-GCM (Python, compatible format) |
+
+---
+
+## Execution Order
+
+| Phase | What | Estimated Effort |
+|-------|------|-----------------|
+| **1** | Foundation: config, DB, models, crypto, migrations | First |
+| **2** | Booking agent: LLM provider, prompts, agent orchestrator | Second (core value) |
+| **3** | Scheduler + Telegram notifications | Third |
+| **4** | API endpoints + admin panel | Fourth |
+| **5** | Docker + deployment config | Fifth |
+| **6** | Local end-to-end test | Final verification |
+
+Each phase is independently testable. Phase 2 (the booking agent) is the core value — we'll test it locally against the real sports portal before adding the surrounding infrastructure.
+
+---
+
+## Verification Plan
+
+### Automated Tests
+- `test_crypto.py` — Verify AES-256-GCM encrypt/decrypt round-trip, key format validation
+- `test_scheduler.py` — Verify APScheduler job creation, trigger time calculation, duplicate prevention
+- `test_agent.py` — Mock LLM provider, verify retry logic, timeout handling
+
+### Manual Verification
+1. **Local agent test**: Run the booking agent against `sports.mitwpu.edu.in` with real credentials to verify the full login → navigate → search → select flow
+2. **Scheduler test**: Create a task with trigger time 2 minutes in the future, verify the agent fires at the correct time
+3. **Telegram test**: Trigger a manual run, verify success/failure notifications arrive
+4. **Docker test**: Build and run `docker compose up`, verify all services start correctly
+5. **Screenshot test**: Force a booking failure, verify screenshot is saved and viewable in the admin panel
