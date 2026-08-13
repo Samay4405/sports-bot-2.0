@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="Sports Bot v2 — Admin Dashboard">
+    <title>Sports Bot v2 — Dashboard</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+</head>
+<body>
+    <!-- Header -->
+    <header class="header">
+        <div class="header-content">
+            <div class="logo">
+                <span class="logo-icon">🏟️</span>
+                <h1>Sports Bot <span class="version">v2</span></h1>
+            </div>
+            <nav class="nav">
+                <a href="/" class="nav-link active">Dashboard</a>
+                <a href="/docs" class="nav-link" target="_blank">API Docs</a>
+            </nav>
+        </div>
+    </header>
+
+    <main class="container">
+        <!-- Stats Cards -->
+        <section class="stats-grid">
+            <div class="stat-card">
+                <div class="stat-icon">📋</div>
+                <div class="stat-info">
+                    <span class="stat-value">{{ total_tasks }}</span>
+                    <span class="stat-label">Total Tasks</span>
+                </div>
+            </div>
+            <div class="stat-card stat-card--active">
+                <div class="stat-icon">✅</div>
+                <div class="stat-info">
+                    <span class="stat-value">{{ enabled_tasks }}</span>
+                    <span class="stat-label">Active Tasks</span>
+                </div>
+            </div>
+            <div class="stat-card stat-card--schedule">
+                <div class="stat-icon">⏰</div>
+                <div class="stat-info">
+                    <span class="stat-value">{{ scheduled_jobs | length }}</span>
+                    <span class="stat-label">Scheduled Jobs</span>
+                </div>
+            </div>
+            <div class="stat-card stat-card--runs">
+                <div class="stat-icon">🔄</div>
+                <div class="stat-info">
+                    <span class="stat-value">{{ recent_runs | length }}</span>
+                    <span class="stat-label">Recent Runs</span>
+                </div>
+            </div>
+        </section>
+
+        <!-- Two Column Layout -->
+        <div class="dashboard-grid">
+            <!-- Tasks Section -->
+            <section class="panel">
+                <div class="panel-header">
+                    <h2>📋 Booking Tasks</h2>
+                </div>
+                <div class="panel-body">
+                    {% if tasks %}
+                        <div class="task-list">
+                            {% for task in tasks %}
+                            <div class="task-card {% if task.enabled %}task-card--enabled{% else %}task-card--disabled{% endif %}">
+                                <div class="task-header">
+                                    <span class="task-sport">{{ task.sport }}</span>
+                                    <span class="badge {% if task.enabled %}badge--success{% else %}badge--muted{% endif %}">
+                                        {{ "Active" if task.enabled else "Paused" }}
+                                    </span>
+                                </div>
+                                <div class="task-details">
+                                    <span class="task-detail">🕐 {{ task.slot_time }}</span>
+                                    <span class="task-detail">⏰ {{ task.trigger_time }} IST</span>
+                                </div>
+                                {% if task.fallback_slots %}
+                                <div class="task-fallbacks">
+                                    <small>Fallbacks: {{ task.fallback_slots | join(", ") }}</small>
+                                </div>
+                                {% endif %}
+                                <div class="task-actions">
+                                    <button class="btn btn--sm btn--outline"
+                                            onclick="toggleTask('{{ task.id }}')"
+                                            title="{{ 'Pause' if task.enabled else 'Enable' }}">
+                                        {{ "⏸️" if task.enabled else "▶️" }}
+                                    </button>
+                                    <button class="btn btn--sm btn--primary"
+                                            onclick="triggerTask('{{ task.id }}')"
+                                            title="Run Now">
+                                        🚀
+                                    </button>
+                                    <button class="btn btn--sm btn--danger"
+                                            onclick="deleteTask('{{ task.id }}')"
+                                            title="Delete">
+                                        🗑️
+                                    </button>
+                                </div>
+                            </div>
+                            {% endfor %}
+                        </div>
+                    {% else %}
+                        <div class="empty-state">
+                            <p>No booking tasks yet.</p>
+                            <p class="text-muted">Create one via the API: <code>POST /api/tasks</code></p>
+                        </div>
+                    {% endif %}
+                </div>
+            </section>
+
+            <!-- Recent Runs Section -->
+            <section class="panel">
+                <div class="panel-header">
+                    <h2>🔄 Recent Runs</h2>
+                </div>
+                <div class="panel-body">
+                    {% if recent_runs %}
+                        <div class="run-list">
+                            {% for run in recent_runs %}
+                            <div class="run-card run-card--{{ run.status.value }}">
+                                <div class="run-header">
+                                    <span class="run-status">
+                                        {% if run.status.value == 'success' %}✅
+                                        {% elif run.status.value == 'failed' %}❌
+                                        {% elif run.status.value == 'no_slots' %}🚫
+                                        {% elif run.status.value == 'error' %}💥
+                                        {% elif run.status.value == 'running' %}🔄
+                                        {% else %}❓{% endif %}
+                                        {{ run.status.value | capitalize }}
+                                    </span>
+                                    <span class="run-time">
+                                        {{ run.executed_at.strftime('%d-%b %I:%M %p') }}
+                                    </span>
+                                </div>
+                                <div class="run-summary">{{ run.summary or "No summary" }}</div>
+                                <div class="run-meta">
+                                    <span>Attempts: {{ run.attempt_count }}</span>
+                                </div>
+                            </div>
+                            {% endfor %}
+                        </div>
+                    {% else %}
+                        <div class="empty-state">
+                            <p>No runs yet.</p>
+                            <p class="text-muted">Trigger a task to see results here.</p>
+                        </div>
+                    {% endif %}
+                </div>
+            </section>
+        </div>
+
+        <!-- Scheduled Jobs -->
+        <section class="panel">
+            <div class="panel-header">
+                <h2>⏰ Scheduled Jobs</h2>
+            </div>
+            <div class="panel-body">
+                {% if scheduled_jobs %}
+                    <table class="table">
+                        <thead>
+                            <tr>
+                                <th>Job</th>
+                                <th>Trigger</th>
+                                <th>Next Run</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for job in scheduled_jobs %}
+                            <tr>
+                                <td>{{ job.name }}</td>
+                                <td><code>{{ job.trigger }}</code></td>
+                                <td>{{ job.next_run_time or "—" }}</td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                {% else %}
+                    <div class="empty-state">
+                        <p>No jobs scheduled.</p>
+                    </div>
+                {% endif %}
+            </div>
+        </section>
+    </main>
+
+    <!-- Footer -->
+    <footer class="footer">
+        <p>Sports Bot v2 — Agentic Booking System</p>
+    </footer>
+
+    <script>
+        async function toggleTask(taskId) {
+            const res = await fetch(`/api/tasks/${taskId}/toggle`, { method: 'POST' });
+            if (res.ok) location.reload();
+            else alert('Failed to toggle task');
+        }
+
+        async function triggerTask(taskId) {
+            if (!confirm('Run this booking task now?')) return;
+            const res = await fetch(`/api/tasks/${taskId}/trigger`, { method: 'POST' });
+            if (res.ok) {
+                const data = await res.json();
+                alert(data.message);
+                location.reload();
+            } else {
+                alert('Failed to trigger task');
+            }
+        }
+
+        async function deleteTask(taskId) {
+            if (!confirm('Delete this task permanently?')) return;
+            const res = await fetch(`/api/tasks/${taskId}`, { method: 'DELETE' });
+            if (res.ok) location.reload();
+            else alert('Failed to delete task');
+        }
+
+        // Auto-refresh every 30 seconds
+        setTimeout(() => location.reload(), 30000);
+    </script>
+</body>
+</html>
