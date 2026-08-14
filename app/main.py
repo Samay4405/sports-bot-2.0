@@ -136,9 +136,9 @@ async def dashboard(request: Request):
     scheduled_jobs = get_scheduled_jobs()
 
     return templates.TemplateResponse(
-        "dashboard.html",
-        {
-            "request": request,
+        request=request,
+        name="dashboard.html",
+        context={
             "total_tasks": total_tasks,
             "enabled_tasks": enabled_tasks,
             "recent_runs": recent_runs,

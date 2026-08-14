@@ -1,7 +1,7 @@
 """Async SQLAlchemy engine and session management.
 
 Provides:
-- `engine`: Async SQLAlchemy engine bound to PostgreSQL via asyncpg
+- `engine`: Async SQLAlchemy engine (PostgreSQL or SQLite)
 - `get_session()`: FastAPI dependency yielding an async session
 - `init_db()`: Creates all tables (for development; use Alembic in production)
 """
@@ -16,16 +16,23 @@ from sqlmodel import SQLModel
 
 from app.config import settings
 
-# Create the async engine
-# - pool_pre_ping: verify connections are alive before using them
-# - echo: set to True for SQL debugging during development
-engine = create_async_engine(
-    settings.database_url,
-    echo=False,
-    pool_pre_ping=True,
-    pool_size=5,
-    max_overflow=10,
-)
+# Detect database type for engine configuration
+_is_sqlite = settings.database_url.startswith("sqlite")
+
+# Create the async engine with appropriate settings
+_engine_kwargs = {
+    "echo": False,
+}
+
+if not _is_sqlite:
+    # PostgreSQL-specific settings
+    _engine_kwargs.update({
+        "pool_pre_ping": True,
+        "pool_size": 5,
+        "max_overflow": 10,
+    })
+
+engine = create_async_engine(settings.database_url, **_engine_kwargs)
 
 # Session factory
 async_session_factory = sessionmaker(
